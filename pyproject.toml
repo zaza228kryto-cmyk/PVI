@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pvi"
+version = "0.1.0"
+description = "Pulmo Visual Insight (PVI)"
+requires-python = ">=3.10"
+
+dependencies = [
+  "numpy",
+  "pillow",
+  "opencv-python",
+  "timm",
+  "streamlit",
+  "pyside6",
+  "torch",
+  "torchvision",
+]
+
+[project.scripts]
+pvi-desktop = "desktop.launch:main"
+pvi-web = "app.launch:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pvi_core*", "desktop*", "app*"]

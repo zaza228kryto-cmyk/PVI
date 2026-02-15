@@ -1,0 +1,3 @@
+[console_scripts]
+pvi-desktop = desktop.launch:main
+pvi-web = app.launch:main

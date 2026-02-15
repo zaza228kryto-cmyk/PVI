@@ -1,0 +1,19 @@
+services:
+  orthanc:
+    image: orthancteam/orthanc:latest
+    container_name: pvi_orthanc
+    ports:
+      - "8042:8042"
+      - "4242:4242"
+    environment:
+      ORTHANC__NAME: "PVI-Orthanc"
+      ORTHANC__AUTHENTICATION_ENABLED: "false"
+      ORTHANC__DICOM_AET: "PVIORTHANC"
+      ORTHANC__DICOM_PORT: "4242"
+      ORTHANC__HTTP_PORT: "8042"
+      ORTHANC__DICOM_WEB__ENABLE: "true"
+    volumes:
+      - orthanc_db:/var/lib/orthanc/db
+
+volumes:
+  orthanc_db:

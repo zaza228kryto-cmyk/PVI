@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -14,8 +15,8 @@ import timm
 import cv2
 
 
-# MVP findings (locked)
-FINDINGS: List[str] = [
+# UI-метки, которые показываем в продукте (фиксированный порядок)
+UI_FINDINGS: List[str] = [
     "Pneumonia",
     "Tuberculosis",
     "Mass",
@@ -24,59 +25,130 @@ FINDINGS: List[str] = [
     "No Finding",
 ]
 
+# совместимость со старым кодом desktop/web
+FINDINGS = UI_FINDINGS
+
+
 _MODEL: Optional[nn.Module] = None
 _DEVICE: Optional[torch.device] = None
+_MODEL_LABELS: Optional[List[str]] = None  # какие классы реально обучены в загруженном чекпоинте
 
 
 def _get_device() -> torch.device:
     return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
-def _build_model(num_classes: int) -> nn.Module:
-    """
-    EfficientNet-B0 backbone, ImageNet pretrained + new head.
-    NOTE: Not medically trained yet. Probabilities/CAM may be meaningless until training.
-    """
-    model = timm.create_model("efficientnet_b0", pretrained=True, num_classes=num_classes)
-    model.eval()
-    return model
+def _default_weights_path() -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
+    return repo_root / "model" / "weights" / "current.pt"
 
 
-def get_model() -> nn.Module:
-    global _MODEL, _DEVICE
-    if _MODEL is None:
-        _DEVICE = _get_device()
-        _MODEL = _build_model(num_classes=len(FINDINGS)).to(_DEVICE)
-        _MODEL.eval()
-    return _MODEL
+def _load_checkpoint(weights_path: Path, device: torch.device):
+    """
+    Возвращает (state_dict, labels_or_none).
+    Поддерживает:
+      - dict с keys: state_dict, labels
+      - либо "чистый" state_dict
+    """
+    if not weights_path.exists():
+        return None, None
+
+    ckpt = torch.load(weights_path, map_location=device, weights_only=True)
+
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        state_dict = ckpt["state_dict"]
+        labels = ckpt.get("labels", None)
+        return state_dict, labels
+
+    # иначе считаем что это state_dict
+    return ckpt, None
+
+
+def _build_model(num_classes: int, pretrained: bool) -> nn.Module:
+    m = timm.create_model("efficientnet_b0", pretrained=pretrained, num_classes=num_classes)
+    m.eval()
+    return m
+
+
+def get_model() -> Tuple[nn.Module, List[str]]:
+    """
+    Возвращает (model, model_labels).
+    model_labels — список классов, которые реально в выходе модели.
+    """
+    global _MODEL, _DEVICE, _MODEL_LABELS
+
+    if _MODEL is not None and _MODEL_LABELS is not None:
+        return _MODEL, _MODEL_LABELS
+
+    _DEVICE = _get_device()
+    device = _DEVICE
+    weights_path = _default_weights_path()
+
+    state_dict, labels = _load_checkpoint(weights_path, device)
+
+    if state_dict is None:
+        # нет весов — fallback на ImageNet с 6 классами (как раньше)
+        _MODEL_LABELS = UI_FINDINGS[:]
+        _MODEL = _build_model(num_classes=len(_MODEL_LABELS), pretrained=True).to(device)
+        print(f"[PVI] Using ImageNet pretrained (no custom weights). Path: {weights_path}")
+        return _MODEL, _MODEL_LABELS
+
+    # есть веса
+    if isinstance(labels, list) and len(labels) > 0:
+        model_labels = [str(x) for x in labels]
+    else:
+        # если labels не сохранены (на всякий случай)
+        model_labels = UI_FINDINGS[:]
+
+    model = _build_model(num_classes=len(model_labels), pretrained=False).to(device)
+
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except Exception as e:
+        # если вдруг несовместимо — fallback на ImageNet
+        print(f"[PVI] Failed to load weights from {weights_path}: {e}")
+        _MODEL_LABELS = UI_FINDINGS[:]
+        _MODEL = _build_model(num_classes=len(_MODEL_LABELS), pretrained=True).to(device)
+        print(f"[PVI] Using ImageNet pretrained fallback. Path: {weights_path}")
+        return _MODEL, _MODEL_LABELS
+
+    _MODEL = model
+    _MODEL_LABELS = model_labels
+    print(f"[PVI] Loaded custom weights: {weights_path}")
+    print(f"[PVI] Model labels: {_MODEL_LABELS}")
+    return _MODEL, _MODEL_LABELS
 
 
 def preprocess(pil_img: Image.Image) -> torch.Tensor:
-    """
-    - grayscale -> resize 224 -> replicate to 3ch
-    - ImageNet normalization (because pretrained weights)
-    """
     img = pil_img.convert("L").resize((224, 224))
-    arr = np.array(img, dtype=np.float32) / 255.0  # (H, W)
-    arr = np.stack([arr, arr, arr], axis=0)  # (3, H, W)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = np.stack([arr, arr, arr], axis=0)  # (3,H,W)
 
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
     arr = (arr - mean) / std
 
-    t = torch.from_numpy(arr).unsqueeze(0)  # (1, 3, 224, 224)
+    t = torch.from_numpy(arr).unsqueeze(0)
     return t
 
 
 @torch.no_grad()
 def predict_probs(pil_img: Image.Image) -> Dict[str, float]:
-    model = get_model()
+    model, model_labels = get_model()
     device = _DEVICE if _DEVICE is not None else _get_device()
 
     x = preprocess(pil_img).to(device)
-    logits = model(x)  # (1, C)
+    logits = model(x)  # (1,C)
     probs = torch.sigmoid(logits).detach().cpu().numpy()[0].astype(float)
-    return {FINDINGS[i]: float(probs[i]) for i in range(len(FINDINGS))}
+
+    # Сначала probs по реальным выходам модели
+    by_label = {model_labels[i]: float(probs[i]) for i in range(len(model_labels))}
+
+    # А наружу отдаём полный UI-набор (6)
+    out = {}
+    for lab in UI_FINDINGS:
+        out[lab] = float(by_label.get(lab, 0.0))
+    return out
 
 
 # -----------------------
@@ -85,13 +157,12 @@ def predict_probs(pil_img: Image.Image) -> Dict[str, float]:
 
 @dataclass
 class CAMResult:
-    heatmap: np.ndarray      # (224,224) float32 [0,1]
-    overlay: Image.Image     # PIL RGB 224x224
-    contours: Image.Image    # PIL RGB 224x224
+    heatmap: np.ndarray
+    overlay: Image.Image
+    contours: Image.Image
 
 
 def _find_target_layer(model: nn.Module) -> nn.Module:
-    # timm efficientnet has `blocks`; using last block is a robust choice
     if hasattr(model, "blocks"):
         return model.blocks[-1]
     raise RuntimeError("Could not locate target layer for EfficientNet.")
@@ -103,7 +174,7 @@ def _to_uint8_gray(heatmap01: np.ndarray) -> np.ndarray:
 
 def _apply_colormap(heatmap01: np.ndarray) -> np.ndarray:
     h8 = _to_uint8_gray(heatmap01)
-    cm = cv2.applyColorMap(h8, cv2.COLORMAP_TURBO)  # BGR uint8
+    cm = cv2.applyColorMap(h8, cv2.COLORMAP_TURBO)  # BGR
     return cm
 
 
@@ -119,13 +190,13 @@ def _overlay_heatmap(pil_img: Image.Image, heatmap01: np.ndarray, alpha: float) 
     return Image.fromarray(out)
 
 
-def _overlay_contours(pil_img: Image.Image, heatmap01: np.ndarray, thresh: float = 0.55) -> Image.Image:
+def _overlay_contours(pil_img: Image.Image, heatmap01: np.ndarray, thresh: float = 0.55, thickness: int = 2) -> Image.Image:
     base = pil_img.convert("RGB").resize((224, 224))
     base_np = np.array(base, dtype=np.uint8)
 
     mask = (heatmap01 >= float(thresh)).astype(np.uint8) * 255
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(base_np, contours, -1, (255, 255, 255), 2)
+    cv2.drawContours(base_np, contours, -1, (255, 255, 255), int(thickness))
     return Image.fromarray(base_np)
 
 
@@ -136,13 +207,34 @@ def _normalize01(x: np.ndarray) -> np.ndarray:
     return (x / denom).astype(np.float32)
 
 
+def _blank_cam(pil_img: Image.Image) -> CAMResult:
+    heat = np.zeros((224, 224), dtype=np.float32)
+    base = pil_img.convert("RGB").resize((224, 224))
+    return CAMResult(heatmap=heat, overlay=base, contours=base)
+
+
+def _ui_index_to_model_index(ui_index: int, model_labels: List[str]) -> Optional[int]:
+    if ui_index < 0 or ui_index >= len(UI_FINDINGS):
+        return None
+    ui_label = UI_FINDINGS[ui_index]
+    if ui_label in model_labels:
+        return model_labels.index(ui_label)
+    return None
+
+
 # -----------------------
 # Grad-CAM
 # -----------------------
 
 def grad_cam(pil_img: Image.Image, target_index: int, alpha: float = 0.30) -> CAMResult:
-    model = get_model()
+    model, model_labels = get_model()
     device = _DEVICE if _DEVICE is not None else _get_device()
+
+    model_target = _ui_index_to_model_index(target_index, model_labels)
+    if model_target is None:
+        # например TB, когда веса 5-классовые
+        return _blank_cam(pil_img)
+
     x = preprocess(pil_img).to(device)
 
     target_layer = _find_target_layer(model)
@@ -162,12 +254,12 @@ def grad_cam(pil_img: Image.Image, target_index: int, alpha: float = 0.30) -> CA
 
     try:
         logits = model(x)
-        score = logits[0, target_index]
+        score = logits[0, model_target]
         model.zero_grad(set_to_none=True)
         score.backward()
 
-        A = activations[-1]   # (1,C,H,W)
-        G = gradients[-1]     # (1,C,H,W)
+        A = activations[-1]
+        G = gradients[-1]
         w = G.mean(dim=(2, 3), keepdim=True)
         cam = (w * A).sum(dim=1)[0]
         cam = F.relu(cam).detach().cpu().numpy()
@@ -176,7 +268,7 @@ def grad_cam(pil_img: Image.Image, target_index: int, alpha: float = 0.30) -> CA
         cam01 = cv2.resize(cam01, (224, 224), interpolation=cv2.INTER_LINEAR)
 
         overlay = _overlay_heatmap(pil_img, cam01, alpha=float(alpha))
-        contours = _overlay_contours(pil_img, cam01, thresh=0.55)
+        contours = _overlay_contours(pil_img, cam01, thresh=0.55, thickness=2)
         return CAMResult(heatmap=cam01, overlay=overlay, contours=contours)
     finally:
         h1.remove()
@@ -184,7 +276,7 @@ def grad_cam(pil_img: Image.Image, target_index: int, alpha: float = 0.30) -> CA
 
 
 # -----------------------
-# Score-CAM (slower, cleaner)
+# Score-CAM
 # -----------------------
 
 @torch.no_grad()
@@ -194,18 +286,14 @@ def score_cam(
     alpha: float = 0.30,
     max_channels: int = 64,
 ) -> CAMResult:
-    """
-    Score-CAM (approx):
-    - Get activations A from target conv layer: (1,C,H,W)
-    - Upsample each channel map -> mask in [0,1]
-    - For each mask: apply to input image (element-wise) and forward pass -> score for target class
-    - Weighted sum of activation maps by scores -> heatmap
-    Notes:
-    - Very slow if C is large. We cap channels with max_channels (top by activation energy).
-    """
-    model = get_model()
+    model, model_labels = get_model()
     device = _DEVICE if _DEVICE is not None else _get_device()
-    x = preprocess(pil_img).to(device)  # (1,3,224,224)
+
+    model_target = _ui_index_to_model_index(target_index, model_labels)
+    if model_target is None:
+        return _blank_cam(pil_img)
+
+    x = preprocess(pil_img).to(device)
 
     target_layer = _find_target_layer(model)
     acts: List[torch.Tensor] = []
@@ -217,48 +305,42 @@ def score_cam(
 
     h = target_layer.register_forward_hook(fwd_hook)
     try:
-        _ = model(x)  # forward to collect activations
-        A = acts[-1]  # (1,C,H,W)
+        _ = model(x)
+        A = acts[-1]
     finally:
         h.remove()
 
-    A = A.detach()  # (1,C,h,w)
+    A = A.detach()
     _, C, hH, hW = A.shape
 
-    # Select channels by activation energy (reduce compute)
-    energy = (A**2).mean(dim=(2, 3))[0]  # (C,)
+    energy = (A**2).mean(dim=(2, 3))[0]
     k = int(min(max_channels, C))
-    topk = torch.topk(energy, k=k).indices  # (k,)
+    topk = torch.topk(energy, k=k).indices
 
-    A_sel = A[0, topk]  # (k,h,w)
+    A_sel = A[0, topk]
 
-    # Upsample activation maps to input size and normalize each to [0,1]
-    up = F.interpolate(A_sel.unsqueeze(0), size=(224, 224), mode="bilinear", align_corners=False)[0]  # (k,224,224)
+    up = F.interpolate(A_sel.unsqueeze(0), size=(224, 224), mode="bilinear", align_corners=False)[0]
     up_min = up.flatten(1).min(dim=1).values[:, None, None]
     up_max = up.flatten(1).max(dim=1).values[:, None, None]
-    masks = (up - up_min) / (up_max - up_min + 1e-8)  # (k,224,224) in [0,1]
+    masks = (up - up_min) / (up_max - up_min + 1e-8)
 
-    # Prepare masked inputs (k,3,224,224)
-    masks3 = masks.unsqueeze(1).repeat(1, 3, 1, 1)          # (k,3,224,224)
-    x_rep = x.repeat(k, 1, 1, 1)                            # (k,3,224,224)
-    x_masked = x_rep * masks3                               # (k,3,224,224)
+    masks3 = masks.unsqueeze(1).repeat(1, 3, 1, 1)
+    x_rep = x.repeat(k, 1, 1, 1)
+    x_masked = x_rep * masks3
 
-    # Forward in batches to avoid OOM
     batch = 16
     scores = []
     for i in range(0, k, batch):
         xb = x_masked[i:i + batch]
-        logits_b = model(xb)                                # (b,Cout)
-        # use sigmoid(logit) for the target class as "score"
-        s = torch.sigmoid(logits_b[:, target_index])         # (b,)
+        logits_b = model(xb)
+        s = torch.sigmoid(logits_b[:, model_target])
         scores.append(s.detach().cpu())
-    scores_t = torch.cat(scores, dim=0).numpy().astype(np.float32)  # (k,)
+    scores_t = torch.cat(scores, dim=0).numpy().astype(np.float32)
 
-    # Weighted sum of ORIGINAL activation maps (selected), upsampled to 224
-    weights = scores_t / (scores_t.sum() + 1e-8)  # normalize
-    heat = (weights[:, None, None] * masks.detach().cpu().numpy()).sum(axis=0)  # (224,224)
+    weights = scores_t / (scores_t.sum() + 1e-8)
+    heat = (weights[:, None, None] * masks.detach().cpu().numpy()).sum(axis=0)
     heat01 = _normalize01(heat)
 
     overlay = _overlay_heatmap(pil_img, heat01, alpha=float(alpha))
-    contours = _overlay_contours(pil_img, heat01, thresh=0.55)
+    contours = _overlay_contours(pil_img, heat01, thresh=0.55, thickness=2)
     return CAMResult(heatmap=heat01, overlay=overlay, contours=contours)

@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: pvi
+Version: 0.1.0
+Summary: Pulmo Visual Insight (PVI)
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: pillow
+Requires-Dist: opencv-python
+Requires-Dist: timm
+Requires-Dist: streamlit
+Requires-Dist: pyside6
+Requires-Dist: torch
+Requires-Dist: torchvision
